@@ -7,17 +7,17 @@ import MLXNN
 import MLXOptimizers
 import SwiftUI
 import Tokenizers
+import Hub
 
 struct ContentView: View {
 
     @State var evaluator = LoRAEvaluator()
 
     @State var prompt = """
-        table: 1-10015132-16
-        columns: Player, No., Nationality, Position, Years in Toronto, School/Club Team
-        Q: What is terrence ross' nationality
-        A:
+        What is data activism?
         """
+
+    @State var modelId: String = ""
 
     var body: some View {
         VStack {
@@ -55,7 +55,14 @@ struct ContentView: View {
                 VStack {
                     switch evaluator.state {
                     case .idle:
-                        Button("Start", action: start)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Model (Hugging Face ID or leave empty for registry):")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            TextField("e.g. ShukraJaliya/BLUECOMPUTER.2", text: $modelId)
+                                .textFieldStyle(.roundedBorder)
+                            Button("Start") { start() }
+                        }
 
                     case .training:
                         EmptyView()
@@ -83,6 +90,8 @@ struct ContentView: View {
 
     func start() {
         Task {
+            // If a model ID is provided, use it; otherwise the evaluator falls back to the registry configuration
+            evaluator.setModelIdentifier(modelId.isEmpty ? nil : modelId)
             await evaluator.start()
         }
     }
@@ -123,6 +132,7 @@ class LoRAEvaluator {
     var output = ""
 
     private let modelConfiguration = LLMRegistry.mistral7B4bit
+    private var modelIdentifier: String? = nil
     private var model: ModelState = .idle
 
     private let loraLayers = 4
@@ -133,27 +143,51 @@ class LoRAEvaluator {
     private let evaluateShowEvery = 8
     private let maxTokens = 200
 
+    /// Set a model identifier (e.g., "author/model-name") to load by ID instead of registry configuration.
+    func setModelIdentifier(_ id: String?) {
+        // Reset cached model so the next load uses the new source
+        self.model = .idle
+        self.modelIdentifier = id
+    }
+
     private func loadModel() async throws -> ModelContainer {
         switch self.model {
         case .idle:
-            let name = modelConfiguration.name
+            // Prefer loading by explicit identifier if provided; otherwise use registry configuration
+            let displayName = modelIdentifier ?? modelConfiguration.name
             await MainActor.run {
-                progress = .init(title: "Loading \(name)", current: 0, limit: 1)
+                progress = .init(title: "Loading \(displayName)", current: 0, limit: 1)
             }
 
-            let modelContainer = try await LLMModelFactory.shared.loadContainer(
-                configuration: modelConfiguration
-            ) {
-                progress in
-                Task { @MainActor in
-                    self.progress = .init(
-                        title: "Download \(name)", current: progress.fractionCompleted,
-                        limit: 1.0)
+            if let id = modelIdentifier, !id.isEmpty {
+                // Build a configuration from the Hugging Face model ID and load it
+                let config = LLMModelFactory.shared.configuration(id: id)
+                let modelContainer = try await LLMModelFactory.shared.loadContainer(
+                    hub: HubApi(), configuration: config
+                ) { prog in
+                    Task { @MainActor in
+                        self.progress = .init(
+                            title: "Download \(displayName)", current: prog.fractionCompleted,
+                            limit: 1.0)
+                    }
                 }
+                self.model = .loaded(modelContainer)
+                return modelContainer
+            } else {
+                // Fallback: load using registry configuration
+                let name = modelConfiguration.name
+                let modelContainer = try await LLMModelFactory.shared.loadContainer(
+                    configuration: modelConfiguration
+                ) { prog in
+                    Task { @MainActor in
+                        self.progress = .init(
+                            title: "Download \(name)", current: prog.fractionCompleted,
+                            limit: 1.0)
+                        }
+                }
+                self.model = .loaded(modelContainer)
+                return modelContainer
             }
-            self.model = .loaded(modelContainer)
-            return modelContainer
-
         case .loaded(let modelContainer):
             return modelContainer
         }
@@ -282,3 +316,4 @@ class LoRAEvaluator {
         self.progress = nil
     }
 }
+
